@@ -14,6 +14,8 @@ The official GitHub MCP servers want a Personal Access Token. If you already use
   - `gh_run` — passthrough for any `gh` subcommand (e.g. `gh pr list`, `gh repo view`)
   - `gh_api` — structured access to the REST and GraphQL APIs via `gh api`
   - `gh_whoami` — quick `gh auth status` for sanity checks
+- **Auto-surfaced identity**: the active GitHub account is included in the MCP `initialize` response's `instructions`, so the client/model knows who it's acting as without making a tool call.
+- **Disk-cached `gh auth status`** (default 1h TTL) so the server starts up fast and doesn't shell out on every new conversation. Bypassable with `{"refresh":true}` on `gh_whoami` or `--clear-cache` on the CLI.
 - **Zero runtime dependencies** beyond `bash`, `jq`, and `gh`
 - **Optional allowlist** (`GH_MCP_ALLOWLIST`) to restrict which subcommands the server will run
 - **JSON-RPC 2.0 over stdio**, MCP protocol version `2024-11-05`
@@ -122,12 +124,24 @@ Recommended baseline if you want read-mostly access: `"repo,pr,issue,api,auth,se
 - **A call hangs**: probably an interactive `gh` prompt. Re-issue with flags that fully specify the action (`--yes`, `--title`, `--body`, etc.).
 - **Debug logging**: set `GH_MCP_LOG_LEVEL=debug` in the client `env` to log each incoming request.
 
+## Caching
+
+To keep new sessions snappy, `gh auth status` is cached to disk on first call. Subsequent server startups (i.e. every new conversation) read the cached identity instead of forking `gh`.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `GH_MCP_CACHE_TTL_SECONDS` | `3600` | Cache lifetime. Set to `0` to disable caching. |
+| `GH_MCP_CACHE_DIR` | `$XDG_CACHE_HOME/gh-mcp` or `~/.cache/gh-mcp` | Where the cache lives. |
+
+Force a refresh from a tool call: `gh_whoami {"refresh": true}`. From the CLI: `./gh-mcp.sh --clear-cache`. If you switch GitHub accounts via `gh auth login`, run `--clear-cache` (or wait out the TTL) so the next session picks up the new identity.
+
 ## Development
 
 ```sh
 ./gh-mcp.sh --version       # print version
 ./gh-mcp.sh --help          # print usage
 ./gh-mcp.sh --selftest      # run protocol smoke test against a stub gh
+./gh-mcp.sh --clear-cache   # wipe the whoami cache
 ```
 
 To manually drive the server, pipe JSON-RPC into it:
