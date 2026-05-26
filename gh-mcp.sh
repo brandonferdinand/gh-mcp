@@ -10,46 +10,72 @@
 # Dependencies: bash 4+, jq, gh.
 #
 # Optional env vars:
-#   GH_MCP_ALLOWLIST   Comma-separated allowlist of top-level gh subcommands
-#                      (e.g. "repo,pr,issue,api"). When set, any other
-#                      subcommand is refused at the MCP layer before `gh`
-#                      is invoked. Unset = no restriction.
-#   GH_MCP_LOG_LEVEL   "info" (default) or "debug". Debug logs every request.
+#   GH_MCP_ALLOWLIST           Comma-separated allowlist of top-level gh
+#                              subcommands (e.g. "repo,pr,issue,api"). When set,
+#                              any other subcommand is refused at the MCP layer
+#                              before `gh` is invoked. Unset = no restriction.
+#   GH_MCP_LOG_LEVEL           "info" (default) or "debug".
+#   GH_MCP_CACHE_TTL_SECONDS   How long to cache `gh auth status` output on
+#                              disk (default 3600). Set to 0 to disable.
+#   GH_MCP_CACHE_DIR           Override cache directory (default:
+#                              $XDG_CACHE_HOME/gh-mcp or ~/.cache/gh-mcp).
 #
 # CLI modes (when run directly, not as an MCP server):
-#   --help        Print this help text.
-#   --version     Print version.
-#   --selftest    Run an internal JSON-RPC smoke test against a stub gh.
+#   --help          Print this help text.
+#   --version       Print version.
+#   --selftest      Run an internal JSON-RPC smoke test against a stub gh.
+#   --clear-cache   Delete the cached whoami file and exit.
 
 set -u
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 PROTOCOL_VERSION="2024-11-05"
+
+# Where we cache `gh auth status` so we don't re-run it every server startup.
+CACHE_DIR="${GH_MCP_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-mcp}"
+CACHE_FILE="$CACHE_DIR/whoami"
+CACHE_TTL="${GH_MCP_CACHE_TTL_SECONDS:-3600}"  # 0 disables the cache.
 
 log() { printf '[gh-mcp] %s\n' "$*" >&2; }
 debug() { [[ "${GH_MCP_LOG_LEVEL:-info}" == "debug" ]] && log "DEBUG $*"; }
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
   echo
   echo "Version: $VERSION"
 }
 
 # --- CLI mode handling ---------------------------------------------------------
 case "${1:-}" in
-  --help|-h)   usage; exit 0 ;;
+  --help|-h)    usage; exit 0 ;;
   --version|-V) echo "gh-mcp $VERSION"; exit 0 ;;
+  --clear-cache)
+    if [[ -e "${GH_MCP_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-mcp}/whoami" ]]; then
+      rm -f "${GH_MCP_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-mcp}/whoami"
+      echo "Cleared whoami cache."
+    else
+      echo "No whoami cache to clear."
+    fi
+    exit 0
+    ;;
   --selftest)
     # Re-exec self with a fake gh on PATH so we can verify protocol wiring
-    # without touching the real GitHub.
+    # without touching the real GitHub. Isolate the cache to a tempdir.
     if [[ "${_GH_MCP_IN_SELFTEST:-0}" != "1" ]]; then
       tmp=$(mktemp -d)
       trap 'rm -rf "$tmp"' EXIT
       cat >"$tmp/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "auth status") echo "github.com" >&2; echo "  Logged in as selftest-user" >&2; exit 0;;
-  "--version "|"--version ") echo "gh selftest 0.0.0"; exit 0;;
+  "auth status")
+    cat <<'AUTH'
+github.com
+  ✓ Logged in to github.com account selftest-user (keyring)
+  - Active account: true
+  - Token scopes: 'repo'
+AUTH
+    exit 0
+    ;;
 esac
 case "$1" in
   --version) echo "gh selftest 0.0.0"; exit 0;;
@@ -58,14 +84,16 @@ echo "stub gh: $*"
 STUB
       chmod +x "$tmp/gh"
       export _GH_MCP_IN_SELFTEST=1
+      export GH_MCP_CACHE_DIR="$tmp/cache"
       PATH="$tmp:$PATH" "$0" <<EOF
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"gh_whoami","arguments":{}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"gh_run","arguments":{"args":["repo","list","--limit","2"]}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gh_api","arguments":{"endpoint":"/user","method":"GET"}}}
-{"jsonrpc":"2.0","id":6,"method":"ping"}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"gh_whoami","arguments":{"refresh":true}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gh_run","arguments":{"args":["repo","list","--limit","2"]}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"gh_api","arguments":{"endpoint":"/user","method":"GET"}}}
+{"jsonrpc":"2.0","id":7,"method":"ping"}
 EOF
       exit $?
     fi
@@ -155,8 +183,16 @@ TOOLS_JSON='[
   },
   {
     "name": "gh_whoami",
-    "description": "Show which GitHub account `gh` is currently authenticated as on this machine. Wraps `gh auth status`.",
-    "inputSchema": {"type": "object", "properties": {}}
+    "description": "Show which GitHub account `gh` is currently authenticated as on this machine. The active identity is already included in the server'\''s initialize instructions, so you usually do not need to call this tool. Result is cached to disk (GH_MCP_CACHE_TTL_SECONDS, default 1h). Pass {\"refresh\":true} to force a fresh `gh auth status`.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "refresh": {
+          "type": "boolean",
+          "description": "If true, bypass the cache and re-run `gh auth status`."
+        }
+      }
+    }
   }
 ]'
 
@@ -177,6 +213,54 @@ text_result() {
   # $1 = text, $2 = isError ("true"/"false")
   jq -cn --arg text "$1" --argjson isError "$2" \
     '{content:[{type:"text", text:$text}], isError:$isError}'
+}
+
+# --- whoami cache --------------------------------------------------------------
+# Cross-platform `stat -c %Y` / `stat -f %m` for mtime.
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+# Returns the cached `gh auth status` text on stdout; refreshes if missing,
+# stale, or if "force" is passed as $1. Returns gh's exit code.
+cached_whoami() {
+  local force="${1:-}"
+  local now mtime age
+  if [[ "$force" != "force" && "$CACHE_TTL" != "0" && -f "$CACHE_FILE" ]]; then
+    now=$(date +%s)
+    mtime=$(file_mtime "$CACHE_FILE")
+    age=$(( now - mtime ))
+    if (( age < CACHE_TTL )); then
+      debug "whoami cache hit (age=${age}s, ttl=${CACHE_TTL}s)"
+      cat "$CACHE_FILE"
+      return 0
+    fi
+    debug "whoami cache stale (age=${age}s, ttl=${CACHE_TTL}s)"
+  fi
+  local output rc
+  output=$(gh auth status 2>&1)
+  rc=$?
+  if [[ $rc -eq 0 && "$CACHE_TTL" != "0" ]]; then
+    mkdir -p "$CACHE_DIR" 2>/dev/null
+    printf '%s\n' "$output" >"$CACHE_FILE" 2>/dev/null || true
+  fi
+  printf '%s\n' "$output"
+  return $rc
+}
+
+# Extract "<account> on <host>" from `gh auth status` output. Empty if not
+# logged in or format unexpected.
+parse_active_identity() {
+  # Line we look for: "✓ Logged in to github.com account brandonferdinand (...)"
+  awk '
+    /Logged in to/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "to") host = $(i+1)
+        if ($i == "account") { acct = $(i+1); gsub(/[(,)]/, "", acct) }
+      }
+      if (acct && host) { print acct " on " host; exit }
+    }
+  '
 }
 
 # --- helpers -------------------------------------------------------------------
@@ -244,14 +328,24 @@ run_gh() {
 # --- method handlers -----------------------------------------------------------
 handle_initialize() {
   local id="$1"
-  local result
+  local result identity instructions
+  # Resolve active identity from cache (or refresh if stale). Failures are
+  # tolerated — we just omit the instructions field.
+  identity=$(cached_whoami 2>/dev/null | parse_active_identity)
+  if [[ -n "$identity" ]]; then
+    instructions="GitHub identity: $identity. The locally-configured \`gh\` CLI is already authenticated as this account, so you usually do not need to call \`gh_whoami\` to confirm. All gh_run / gh_api calls act as this user."
+  else
+    instructions="The locally-configured \`gh\` CLI does not appear to be logged in. Run \`gh auth login\` on the host machine to authenticate."
+  fi
   result=$(jq -cn \
     --arg pv "$PROTOCOL_VERSION" \
     --arg version "$VERSION" \
+    --arg instructions "$instructions" \
     '{
       protocolVersion: $pv,
       capabilities: {tools: {}},
-      serverInfo: {name: "gh-mcp", version: $version}
+      serverInfo: {name: "gh-mcp", version: $version},
+      instructions: $instructions
     }')
   send_response "$id" "$result"
 }
@@ -327,6 +421,18 @@ handle_gh_api() {
   send_response "$id" "$(run_gh "" "${args[@]}")"
 }
 
+handle_gh_whoami() {
+  local id="$1" params="$2"
+  local refresh text rc force=""
+  refresh=$(jq -r '.arguments.refresh // false' <<<"$params")
+  [[ "$refresh" == "true" ]] && force="force"
+  text=$(cached_whoami "$force")
+  rc=$?
+  local is_error="false"
+  [[ $rc -ne 0 ]] && is_error="true"
+  send_response "$id" "$(text_result "$text" "$is_error")"
+}
+
 handle_tools_call() {
   local id="$1" params="$2"
   local name
@@ -334,7 +440,7 @@ handle_tools_call() {
   case "$name" in
     gh_run)    handle_gh_run    "$id" "$params" ;;
     gh_api)    handle_gh_api    "$id" "$params" ;;
-    gh_whoami) send_response "$id" "$(run_gh '' auth status)" ;;
+    gh_whoami) handle_gh_whoami "$id" "$params" ;;
     '')        send_error "$id" -32602 "Missing tool name" ;;
     *)         send_error "$id" -32602 "Unknown tool: $name" ;;
   esac
@@ -342,8 +448,8 @@ handle_tools_call() {
 
 # --- startup info --------------------------------------------------------------
 gh_version=$(gh --version 2>/dev/null | head -1 || echo "unknown")
-active_account=$(gh auth status 2>&1 | awk -F'account ' '/Logged in to/ {print $2; exit}' | awk '{print $1}')
-log "starting v$VERSION (gh: $gh_version; account: ${active_account:-unknown})"
+active_identity=$(cached_whoami 2>/dev/null | parse_active_identity)
+log "starting v$VERSION (gh: $gh_version; identity: ${active_identity:-unknown}; cache: ${CACHE_FILE})"
 if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
   log "allowlist active: ${!ALLOWLIST[*]}"
 fi
