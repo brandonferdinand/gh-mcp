@@ -23,7 +23,7 @@ The official GitHub MCP servers want a Personal Access Token. If you already use
 
 ## Requirements
 
-- macOS or Linux with **bash 4+**
+- macOS or Linux. Works on stock macOS bash 3.2; no `brew install bash` needed.
 - [`gh`](https://cli.github.com/) installed and authenticated. Check with `gh auth status`.
 - `jq` on PATH. Install with `brew install jq` or `apt install jq`.
 
