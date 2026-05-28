@@ -7,7 +7,7 @@
 # Protocol: JSON-RPC 2.0 over stdio, newline-delimited (one JSON message
 # per line). Implements MCP methods: initialize, tools/list, tools/call, ping.
 #
-# Dependencies: bash 4+, jq, gh.
+# Dependencies: bash 3.2+ (macOS stock bash works), jq, gh.
 #
 # Optional env vars:
 #   GH_MCP_ALLOWLIST           Comma-separated allowlist of top-level gh
@@ -28,7 +28,7 @@
 
 set -u
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 PROTOCOL_VERSION="2024-11-05"
 
 # Where we cache `gh auth status` so we don't re-run it every server startup.
@@ -45,7 +45,7 @@ usage() {
   echo "Version: $VERSION"
 }
 
-# --- CLI mode handling ---------------------------------------------------------
+# --- CLI mode handling ------------------------------------------------------
 case "${1:-}" in
   --help|-h)    usage; exit 0 ;;
   --version|-V) echo "gh-mcp $VERSION"; exit 0 ;;
@@ -100,21 +100,21 @@ EOF
     ;;
 esac
 
-# --- dependency check ----------------------------------------------------------
-if ((BASH_VERSINFO[0] < 4)); then
-  log "ERROR: bash 4+ required (current: ${BASH_VERSION})"
-  exit 1
-fi
+# --- dependency check -------------------------------------------------------------
+# Note: this script targets bash 3.2+ so it runs on stock macOS bash without
+# `brew install bash`. Anything bash 4+ here (associative arrays, namerefs,
+# mapfile) would break that contract — see allowlist + json_array_to_bash.
 command -v gh >/dev/null 2>&1 || { log "ERROR: 'gh' not found on PATH ($PATH)"; exit 1; }
 command -v jq >/dev/null 2>&1 || { log "ERROR: 'jq' not found on PATH ($PATH)"; exit 1; }
 
-# Parse allowlist (if any) into a bash associative array for O(1) lookup.
-declare -A ALLOWLIST=()
+# Parse allowlist (if any) into an indexed bash array. Small list, linear
+# lookup is fine — we shell out to `gh` anyway, which dwarfs the comparison.
+ALLOWLIST=()
 if [[ -n "${GH_MCP_ALLOWLIST:-}" ]]; then
   IFS=',' read -ra _allow <<<"$GH_MCP_ALLOWLIST"
   for cmd in "${_allow[@]}"; do
     cmd="${cmd// /}"
-    [[ -n "$cmd" ]] && ALLOWLIST["$cmd"]=1
+    [[ -n "$cmd" ]] && ALLOWLIST+=("$cmd")
   done
 fi
 
@@ -215,7 +215,7 @@ text_result() {
     '{content:[{type:"text", text:$text}], isError:$isError}'
 }
 
-# --- whoami cache --------------------------------------------------------------
+# --- whoami cache ---------------------------------------------------------------
 # Cross-platform `stat -c %Y` / `stat -f %m` for mtime.
 file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
@@ -263,7 +263,7 @@ parse_active_identity() {
   '
 }
 
-# --- helpers -------------------------------------------------------------------
+# --- helpers ------------------------------------------------------------------
 # Materialise a JSON array into a bash array (NUL-delimited so spaces/newlines
 # in arg values survive intact). Usage:
 #   local -a OUT
@@ -275,19 +275,23 @@ json_array_to_bash() {
   while IFS= read -r -d '' a; do
     _tmp+=("$a")
   done < <(jq -j '.[] | . + "\u0000"' <<<"$json")
-  # Assign back via nameref (bash 4.3+) — fall back to eval for older bash.
-  if declare -n _ref="$varname" 2>/dev/null; then
-    _ref=("${_tmp[@]}")
+  # eval-based assignment works on bash 3.2; nameref would need 4.3+.
+  if [[ ${#_tmp[@]} -eq 0 ]]; then
+    eval "$varname=()"
   else
     eval "$varname=(\"\${_tmp[@]}\")"
   fi
 }
 
 allowed_subcommand() {
-  # Returns 0 if subcommand is allowed, 1 otherwise.
-  local sub="$1"
+  # Returns 0 if subcommand is allowed, 1 otherwise. Linear scan over the
+  # indexed array — small list, and we shell out to `gh` after this anyway.
+  local sub="$1" cmd
   [[ ${#ALLOWLIST[@]} -eq 0 ]] && return 0
-  [[ -n "${ALLOWLIST[$sub]:-}" ]]
+  for cmd in "${ALLOWLIST[@]}"; do
+    [[ "$cmd" == "$sub" ]] && return 0
+  done
+  return 1
 }
 
 run_gh() {
@@ -451,7 +455,7 @@ gh_version=$(gh --version 2>/dev/null | head -1 || echo "unknown")
 active_identity=$(cached_whoami 2>/dev/null | parse_active_identity)
 log "starting v$VERSION (gh: $gh_version; identity: ${active_identity:-unknown}; cache: ${CACHE_FILE})"
 if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
-  log "allowlist active: ${!ALLOWLIST[*]}"
+  log "allowlist active: ${ALLOWLIST[*]}"
 fi
 
 # --- main loop -----------------------------------------------------------------
