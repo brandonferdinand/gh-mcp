@@ -31,6 +31,7 @@ The official GitHub MCP servers want a Personal Access Token. If you already use
 
 ```sh
 # 1. Drop the script somewhere stable
+mkdir -p ~/bin
 curl -fsSL https://raw.githubusercontent.com/brandonferdinand/gh-mcp/main/gh-mcp.sh \
   -o ~/bin/gh-mcp.sh
 chmod +x ~/bin/gh-mcp.sh
